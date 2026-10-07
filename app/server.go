@@ -29,6 +29,7 @@ import (
 	"github.com/srl-labs/bond"
 	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
@@ -797,15 +798,26 @@ func (s *server) gnmiSocket() string {
 }
 
 func (s *server) createGNMIClient(ctx context.Context) (*grpc.ClientConn, gnmi.GNMIClient, error) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, retryInterval)
-	defer cancel()
-	conn, err := grpc.DialContext(timeoutCtx,
+	conn, err := grpc.NewClient(
 		s.gnmiSocket(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	)
 	if err != nil {
 		return nil, nil, err
 	}
-	return conn, gnmi.NewGNMIClient(conn), nil
+	// NewClient does not dial until an RPC. Connect here so a missing socket
+	// fails inside the timeout instead of on the first Get.
+	timeoutCtx, cancel := context.WithTimeout(ctx, retryInterval)
+	defer cancel()
+	conn.Connect()
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return conn, gnmi.NewGNMIClient(conn), nil
+		}
+		if !conn.WaitForStateChange(timeoutCtx, state) {
+			conn.Close()
+			return nil, nil, timeoutCtx.Err()
+		}
+	}
 }
