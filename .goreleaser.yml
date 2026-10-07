@@ -8,6 +8,7 @@ builds:
       - linux
     goarch:
       - amd64
+      - arm64
 archives:
   - name_template: >-
       {{ .ProjectName }}_
@@ -35,11 +36,10 @@ nfpms:
       {{- if eq .Arch "amd64" }}x86_64
       {{- else }}{{ .Arch }}{{ end }}
     vendor: Nokia
-    homepage: https://github.com/karimra/srl-prometheus-exporter
-    maintainer: Karim Radhouani <karim.radhouani@nokia.com>
+    homepage: https://github.com/srl-labs/srl-prometheus-exporter
+    maintainer: Sergio Chavez <sergio.chavez@nokia.com>
     description: A Prometheus exporter for Nokia SR Linux
     formats:
-      - rpm
       - deb
     license: "BSD 2"
     bindir: /usr/local/bin/
@@ -57,6 +57,3 @@ nfpms:
     scripts:
       postinstall: "scripts/postinstall.sh"
       postremove: "scripts/postremove.sh"
-    overrides:
-      rpm:
-        scripts:

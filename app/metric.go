@@ -20,10 +20,9 @@ var knownMetrics = map[string][]string{
 	"acl": {
 		"/acl/policers/system-cpu-policer/statistics",
 		"/acl/policers/policer/statistics",
-		"/acl/ipv4-filter/entry/statistics",
-		"/acl/ipv6-filter/entry/statistics",
-		"/acl/cpm-filter/ipv4-filter/entry/statistics",
-		"/acl/cpm-filter/ipv6-filter/entry/statistics",
+		"/acl/acl-filter/entry/statistics",
+		"/acl/interface/input/acl-filter/entry/statistics",
+		"/acl/interface/output/acl-filter/entry/statistics",
 	},
 	"aaa": {
 		"/system/aaa/server-group/server/statistics",

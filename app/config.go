@@ -8,7 +8,7 @@ import (
 
 	"github.com/nokia/srlinux-ndk-go/ndk"
 	log "github.com/sirupsen/logrus"
-	"google.golang.org/protobuf/encoding/prototext"
+	"github.com/srl-labs/bond"
 )
 
 const (
@@ -20,12 +20,22 @@ const (
 	adminEnable  = "ADMIN_STATE_enable"
 	adminDisable = "ADMIN_STATE_disable"
 
-	stateEnable  = "STATE_enable"
-	stateDisable = "STATE_disable"
+	commitEndPath = ".commit.end"
 
-	exporterPath     = ".system.prometheus_exporter"
-	metricPath       = ".system.prometheus_exporter.metric"
-	customMetricPath = ".system.prometheus_exporter.custom_metric"
+	// Config notifications from bond use YANG names with hyphens.
+	exporterPath     = "/system/prometheus-exporter"
+	metricPath       = "/system/prometheus-exporter/metric"
+	customMetricPath = "/system/prometheus-exporter/custom-metric"
+
+	// State paths keep NDK underscores. bond converts '/' and list keys,
+	// and leaves '_' in place, which is the js_path form SR Linux expects.
+	exporterStatePath     = "/system/prometheus_exporter"
+	metricStatePath       = "/system/prometheus_exporter/metric"
+	customMetricStatePath = "/system/prometheus_exporter/custom_metric"
+
+	opCreate = "SDK_MGR_OPERATION_CREATE"
+	opUpdate = "SDK_MGR_OPERATION_UPDATE"
+	opDelete = "SDK_MGR_OPERATION_DELETE"
 )
 
 type stringValue struct {
@@ -46,7 +56,7 @@ type config struct {
 	baseConfig *baseConfig
 
 	m            *sync.Mutex
-	trx          []*ndk.ConfigNotification
+	trx          []*bond.ConfigNotification
 	nwInst       map[string]*ndk.NetworkInstanceData
 	metrics      map[string]*metricConfig
 	customMetric map[string]*customMetricConfig
@@ -54,8 +64,9 @@ type config struct {
 	// from file
 	username string
 	password string
-	//
-	debug bool
+	// cliDebug stays on when the process was started with -d.
+	cliDebug bool
+	debug    bool
 }
 
 type FileConfig struct {
@@ -72,7 +83,7 @@ func NewConfig(fc *FileConfig, agentName string, debug bool) *config {
 	kmetrics := make(map[string]*metricConfig)
 	for n := range knownMetrics {
 		kmetrics[n] = &metricConfig{}
-		kmetrics[n].Metric.State = stateDisable
+		kmetrics[n].Metric.State = adminDisable
 	}
 	bcfg := &baseConfig{
 		AdminState: adminDisable,
@@ -88,17 +99,20 @@ func NewConfig(fc *FileConfig, agentName string, debug bool) *config {
 		customMetric: make(map[string]*customMetricConfig),
 		username:     fc.Username,
 		password:     fc.Password,
+		cliDebug:     debug,
 		debug:        debug,
 	}
 }
 
 type baseConfig struct {
 	AdminState      string        `json:"admin_state,omitempty"`
+	Debug           string        `json:"debug,omitempty"`
 	OperState       string        `json:"oper_state,omitempty"`
 	NetworkInstance stringValue   `json:"network_instance,omitempty"`
 	Address         stringValue   `json:"address,omitempty"`
 	Port            stringValue   `json:"port,omitempty"`
 	HttpPath        stringValue   `json:"http_path,omitempty"`
+	GRPCServer      stringValue   `json:"grpc_server,omitempty"`
 	ScrapesCount    uint64Value   `json:"scrapes_count,omitempty"`
 	Registration    *registration `json:"registration,omitempty"`
 }
@@ -112,7 +126,7 @@ type customMetricConfig struct {
 }
 
 type metric struct {
-	State    string        `json:"state,omitempty"`
+	State    string        `json:"admin_state,omitempty"`
 	HelpText stringValue   `json:"help_text,omitempty"`
 	Paths    []stringValue `json:"paths,omitempty"`
 }
@@ -130,123 +144,103 @@ type registration struct {
 }
 
 func (s *server) ConfigHandler(ctx context.Context) {
-	cfgStream := s.agent.StartConfigNotificationStream(ctx)
-	nwInstStream := s.agent.StartNwInstNotificationStream(ctx)
+	// Network-instance notifications need a second NDK stream. The server
+	// rejects that create, so the namespace is resolved as srbase-<name>.
 	for {
 		select {
-		case nwInstEvent := <-nwInstStream:
+		case nwInst, ok := <-s.agent.Notifications.NwInst:
+			if !ok {
+				return
+			}
 			if s.config.debug {
-				log.Debugf("NwInst notification: %+v", nwInstEvent)
-				b, err := prototext.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(nwInstEvent)
-				if err != nil {
-					log.Errorf("NwInst notification Marshal failed: %+v", err)
-					continue
-				}
-				log.Debugf("%s", string(b))
+				log.Debugf("NwInst notification: %+v", nwInst)
 			}
-			for _, ev := range nwInstEvent.GetNotification() {
-				if nwInst := ev.GetNwInst(); nwInst != nil {
-					s.handleNwInstCfg(ctx, nwInst)
-					continue
-				}
-				log.Warnf("got empty nwInst, event: %+v", ev)
+			s.handleNwInstCfg(ctx, nwInst)
+		case cfg, ok := <-s.agent.Notifications.Config:
+			if !ok {
+				return
 			}
-		case event := <-cfgStream:
 			if s.config.debug {
-				log.Debugf("Config notification: %+v", event)
-				b, err := prototext.MarshalOptions{Multiline: true, Indent: "  "}.Marshal(event)
-				if err != nil {
-					log.Errorf("Config notification Marshal failed: %+v", err)
-					continue
-				}
-				log.Debugf("%s", string(b))
+				log.Debugf("Config notification: %+v", cfg)
 			}
-			for _, ev := range event.GetNotification() {
-				if cfg := ev.GetConfig(); cfg != nil {
-					s.handleConfigEvent(ctx, cfg)
-					continue
-				}
-				log.Warnf("got empty config, event: %+v", ev)
-			}
+			s.handleConfigEvent(ctx, cfg)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (s *server) handleConfigEvent(ctx context.Context, cfg *ndk.ConfigNotification) {
+func (s *server) handleConfigEvent(ctx context.Context, cfg *bond.ConfigNotification) {
 	s.config.m.Lock()
 	defer s.config.m.Unlock()
 
 	log.Debugf("handling cfg: %+v", cfg)
-	log.Debugf("PATH: %s\n", cfg.GetKey().GetJsPath())
-	log.Debugf("KEYS: %v\n", cfg.GetKey().GetKeys())
-	log.Debugf("JSON:\n%s\n", cfg.GetData().GetJson())
+	log.Debugf("PATH: %s\n", cfg.PathWithoutKeys)
+	log.Debugf("KEYS: %v\n", cfg.Keys)
+	log.Debugf("JSON:\n%s\n", cfg.Json)
 
-	jsPath := cfg.GetKey().GetJsPath()
 	// collect non commit.end config notifications
-	if jsPath != ".commit.end" {
+	if cfg.Path != commitEndPath {
 		s.config.trx = append(s.config.trx, cfg)
 		return
 	}
-	// when paths is ".commit.end", handle the stored config notifications
+	// when the path is ".commit.end", handle the stored config notifications
 	for _, txCfg := range s.config.trx {
-		switch txCfg.GetKey().GetJsPath() {
+		switch txCfg.PathWithoutKeys {
 		case exporterPath:
 			switch txCfg.Op {
-			case ndk.SdkMgrOperation_Create:
+			case opCreate:
 				s.handleCfgPrometheusCreate(ctx, txCfg)
-			case ndk.SdkMgrOperation_Update:
+			case opUpdate:
 				s.handleCfgPrometheusChange(ctx, txCfg)
-			case ndk.SdkMgrOperation_Delete:
+			case opDelete:
 				log.Errorf("received delete Operation for path %q, this is unexpected...", exporterPath)
 			}
 		case metricPath:
-			if len(txCfg.GetKey().GetKeys()) == 0 {
+			if len(txCfg.Keys) == 0 {
 				log.Errorf("%q no keys in cfg notification: %+v", metricPath, txCfg)
-				return
+				continue
 			}
 			switch txCfg.Op {
-			case ndk.SdkMgrOperation_Create:
+			case opCreate:
 				s.handleCfgMetricCreate(ctx, txCfg)
-			case ndk.SdkMgrOperation_Update:
+			case opUpdate:
 				s.handleCfgMetricChange(ctx, txCfg)
-			case ndk.SdkMgrOperation_Delete:
+			case opDelete:
 				s.handleCfgMetricDelete(ctx, txCfg)
 			}
 		case customMetricPath:
-			if len(txCfg.Key.Keys) == 0 {
+			if len(txCfg.Keys) == 0 {
 				log.Errorf("%q no keys in cfg notification: %+v", customMetricPath, txCfg)
-				return
+				continue
 			}
 			switch txCfg.Op {
-			case ndk.SdkMgrOperation_Update:
+			case opUpdate:
 				s.handleCfgCustomMetricCreateChange(ctx, txCfg)
-			case ndk.SdkMgrOperation_Create:
+			case opCreate:
 				s.handleCfgCustomMetricCreateChange(ctx, txCfg)
-			case ndk.SdkMgrOperation_Delete:
+			case opDelete:
 				s.handleCfgCustomMetricDelete(ctx, txCfg)
 			}
 		default:
-			log.Errorf("unexpected config path %q", txCfg.GetKey().GetJsPath())
+			log.Errorf("unexpected config path %q", txCfg.PathWithoutKeys)
 		}
 	}
-	s.config.trx = make([]*ndk.ConfigNotification, 0)
+	s.config.trx = make([]*bond.ConfigNotification, 0)
 }
 
-func (s *server) handleCfgPrometheusCreate(ctx context.Context, cfg *ndk.ConfigNotification) {
+func (s *server) handleCfgPrometheusCreate(ctx context.Context, cfg *bond.ConfigNotification) {
 	newCfg := &baseConfig{
 		Registration: &registration{
 			AdminState: adminDisable,
 			OperState:  operDown,
 		},
 	}
-	err := json.Unmarshal([]byte(cfg.GetData().GetJson()), newCfg)
+	err := json.Unmarshal([]byte(cfg.Json), newCfg)
 	if err != nil {
-		log.Errorf("failed to marshal config data from path %q: %v", cfg.GetKey().GetJsPath(), err)
+		log.Errorf("failed to marshal config data from path %q: %v", cfg.PathWithoutKeys, err)
 		return
 	}
-
 	if s.config.debug {
 		b, err := json.MarshalIndent(newCfg, "", "  ")
 		if err != nil {
@@ -260,6 +254,7 @@ func (s *server) handleCfgPrometheusCreate(ctx context.Context, cfg *ndk.ConfigN
 	newCfg.OperState = operDown
 	// store initial config
 	s.config.baseConfig = newCfg
+	s.applyDebug(newCfg.Debug)
 
 	// start server if admin-state == enable
 	if newCfg.AdminState == adminEnable && s.config.baseConfig.OperState != operStarting {
@@ -270,16 +265,15 @@ func (s *server) handleCfgPrometheusCreate(ctx context.Context, cfg *ndk.ConfigN
 	s.updatePrometheusBaseTelemetry(ctx, newCfg)
 }
 
-func (s *server) handleCfgPrometheusChange(ctx context.Context, cfg *ndk.ConfigNotification) {
+func (s *server) handleCfgPrometheusChange(ctx context.Context, cfg *bond.ConfigNotification) {
 	newCfg := &baseConfig{
 		Registration: new(registration),
 	}
-	err := json.Unmarshal([]byte(cfg.GetData().GetJson()), newCfg)
+	err := json.Unmarshal([]byte(cfg.Json), newCfg)
 	if err != nil {
-		log.Errorf("failed to marshal config data from path %q: %v", cfg.GetKey().GetJsPath(), err)
+		log.Errorf("failed to marshal config data from path %q: %v", cfg.PathWithoutKeys, err)
 		return
 	}
-
 	if s.config.debug {
 		b, err := json.MarshalIndent(newCfg, "", "  ")
 		if err != nil {
@@ -289,46 +283,53 @@ func (s *server) handleCfgPrometheusChange(ctx context.Context, cfg *ndk.ConfigN
 		log.Debugf("read baseconfig data: %s", string(b))
 	}
 
-	if newCfg.AdminState == adminDisable && s.config.baseConfig.OperState != operDown {
+	s.applyDebug(newCfg.Debug)
+
+	prevOper := s.config.baseConfig.OperState
+	prevRegOper := operDown
+	if s.config.baseConfig.Registration != nil {
+		prevRegOper = s.config.baseConfig.Registration.OperState
+	}
+	if newCfg.Registration == nil {
+		newCfg.Registration = &registration{}
+	}
+	newCfg.OperState = prevOper
+	newCfg.Registration.OperState = prevRegOper
+	s.config.baseConfig = newCfg
+
+	if newCfg.AdminState == adminDisable && prevOper != operDown {
 		// shutdown the http server with a 500ms timeout
 		s.shutdown(ctx, time.Second/2)
 		return
 	}
-	if newCfg.AdminState == adminEnable && s.config.baseConfig.OperState == operDown {
+	if newCfg.AdminState == adminEnable && prevOper == operDown {
 		// start http server
 		log.Debug("starting server...")
-		s.config.baseConfig.AdminState = adminEnable
 		go s.start(ctx)
 		return
 	}
 	// HTTP server already running, check if registration has to be started or stopped
-	if s.config.baseConfig.OperState == operUp && s.config.baseConfig.AdminState == adminEnable {
+	if prevOper == operUp && newCfg.AdminState == adminEnable {
 		log.Debug("server is up, checking if registration needs to be started...")
 		// server is already up, check if registration needs to be started
-		if newCfg.Registration.AdminState == adminEnable && s.config.baseConfig.Registration.OperState == operDown {
+		if newCfg.Registration.AdminState == adminEnable && prevRegOper == operDown {
 			go s.registerService(ctx)
-		} else if newCfg.Registration.AdminState == adminDisable && s.config.baseConfig.OperState != operUp {
+		} else if newCfg.Registration.AdminState == adminDisable && prevOper != operUp {
 			if s.regCancelFn != nil {
 				s.regCancelFn()
 			}
 		}
 	}
 
-	// save current oper state
-	newCfg.OperState = s.config.baseConfig.OperState
-	newCfg.Registration.OperState = s.config.baseConfig.Registration.OperState
-	// store new config
-	s.config.baseConfig = newCfg
-	// update internal telemetry status
 	s.updatePrometheusBaseTelemetry(ctx, s.config.baseConfig)
 }
 
-func (s *server) handleCfgMetricCreate(ctx context.Context, cfg *ndk.ConfigNotification) {
-	key := cfg.Key.Keys[0]
+func (s *server) handleCfgMetricCreate(ctx context.Context, cfg *bond.ConfigNotification) {
+	key := cfg.Keys[0]
 	newMetricConfig := new(metricConfig)
-	err := json.Unmarshal([]byte(cfg.GetData().GetJson()), newMetricConfig)
+	err := json.Unmarshal([]byte(cfg.Json), newMetricConfig)
 	if err != nil {
-		log.Errorf("failed to marshal config data from path %s: %v", cfg.Key.JsPath, err)
+		log.Errorf("failed to marshal config data from path %s: %v", cfg.PathWithoutKeys, err)
 		return
 	}
 	log.Debugf("read metric config data: %+v", newMetricConfig)
@@ -350,12 +351,12 @@ func (s *server) handleCfgMetricCreate(ctx context.Context, cfg *ndk.ConfigNotif
 	s.updateMetricTelemetry(ctx, key, newMetricConfig)
 }
 
-func (s *server) handleCfgMetricChange(ctx context.Context, cfg *ndk.ConfigNotification) {
-	key := cfg.Key.Keys[0]
+func (s *server) handleCfgMetricChange(ctx context.Context, cfg *bond.ConfigNotification) {
+	key := cfg.Keys[0]
 	newMetricConfig := new(metricConfig)
-	err := json.Unmarshal([]byte(cfg.GetData().GetJson()), newMetricConfig)
+	err := json.Unmarshal([]byte(cfg.Json), newMetricConfig)
 	if err != nil {
-		log.Errorf("failed to marshal config data from path %s: %v", cfg.Key.JsPath, err)
+		log.Errorf("failed to marshal config data from path %s: %v", cfg.PathWithoutKeys, err)
 		return
 	}
 
@@ -365,24 +366,24 @@ func (s *server) handleCfgMetricChange(ctx context.Context, cfg *ndk.ConfigNotif
 	s.updateMetricTelemetry(ctx, key, newMetricConfig)
 }
 
-func (s *server) handleCfgMetricDelete(ctx context.Context, cfg *ndk.ConfigNotification) {
-	key := cfg.Key.Keys[0]
+func (s *server) handleCfgMetricDelete(ctx context.Context, cfg *bond.ConfigNotification) {
+	key := cfg.Keys[0]
 
 	if _, ok := s.config.metrics[key]; !ok {
 		log.Errorf("Op delete metric, cannot find metric %q", key)
 		return
 	}
 	s.config.metrics[key] = &metricConfig{}
-	s.config.metrics[key].Metric.State = stateDisable
+	s.config.metrics[key].Metric.State = adminDisable
 	s.deleteMetricTelemetry(ctx, key)
 }
 
-func (s *server) handleCfgCustomMetricCreateChange(ctx context.Context, cfg *ndk.ConfigNotification) {
-	key := cfg.Key.Keys[0]
+func (s *server) handleCfgCustomMetricCreateChange(ctx context.Context, cfg *bond.ConfigNotification) {
+	key := cfg.Keys[0]
 	newMetricConfig := new(customMetricConfig)
-	err := json.Unmarshal([]byte(cfg.GetData().GetJson()), newMetricConfig)
+	err := json.Unmarshal([]byte(cfg.Json), newMetricConfig)
 	if err != nil {
-		log.Errorf("failed to marshal config data from path %s: %v", cfg.Key.JsPath, err)
+		log.Errorf("failed to marshal config data from path %s: %v", cfg.PathWithoutKeys, err)
 		return
 	}
 	log.Debugf("read metric config data: %+v", newMetricConfig)
@@ -397,8 +398,8 @@ func (s *server) handleCfgCustomMetricCreateChange(ctx context.Context, cfg *ndk
 	s.updateCustomMetricTelemetry(ctx, key, newMetricConfig)
 }
 
-func (s *server) handleCfgCustomMetricDelete(ctx context.Context, cfg *ndk.ConfigNotification) {
-	key := cfg.Key.Keys[0]
+func (s *server) handleCfgCustomMetricDelete(ctx context.Context, cfg *bond.ConfigNotification) {
+	key := cfg.Keys[0]
 
 	if _, ok := s.config.customMetric[key]; !ok {
 		log.Errorf("Op delete custom metric, cannot find custom metric %q", key)
@@ -416,21 +417,24 @@ func (s *server) handleNwInstCfg(ctx context.Context, nwInst *ndk.NetworkInstanc
 	if key == nil {
 		return
 	}
-	switch nwInst.Op {
-	case ndk.SdkMgrOperation_Create:
-		s.config.nwInst[key.InstName] = nwInst.Data
-		if s.config.baseConfig.NetworkInstance.Value == nwInst.Key.InstName {
-			if nwInst.Data.OperIsUp &&
+	name := key.GetInstanceName()
+	data := nwInst.GetData()
+	log.Debugf("network instance %q op %s base %q oper-up %t", name, nwInst.GetOp(), data.GetBaseName(), data.GetOperIsUp())
+	switch nwInst.GetOp() {
+	case ndk.SdkMgrOperation_SDK_MGR_OPERATION_CREATE:
+		s.config.nwInst[name] = data
+		if s.config.baseConfig.NetworkInstance.Value == name {
+			if data.GetOperIsUp() &&
 				s.config.baseConfig.AdminState == adminEnable &&
 				s.config.baseConfig.OperState == operDown {
 				log.Debug("starting server...")
 				go s.start(ctx)
 			}
 		}
-	case ndk.SdkMgrOperation_Update:
-		s.config.nwInst[key.InstName] = nwInst.Data
-		if s.config.baseConfig.NetworkInstance.Value == nwInst.Key.InstName {
-			if !nwInst.Data.OperIsUp {
+	case ndk.SdkMgrOperation_SDK_MGR_OPERATION_UPDATE:
+		s.config.nwInst[name] = data
+		if s.config.baseConfig.NetworkInstance.Value == name {
+			if data == nil || !data.GetOperIsUp() {
 				if s.config.baseConfig.OperState == operUp {
 					s.shutdown(ctx, time.Second/2)
 				}
@@ -442,12 +446,42 @@ func (s *server) handleNwInstCfg(ctx context.Context, nwInst *ndk.NetworkInstanc
 				go s.start(ctx)
 			}
 		}
-	case ndk.SdkMgrOperation_Delete:
-		delete(s.config.nwInst, key.InstName)
-		if s.config.baseConfig.NetworkInstance.Value == nwInst.Key.InstName {
+	case ndk.SdkMgrOperation_SDK_MGR_OPERATION_DELETE:
+		delete(s.config.nwInst, name)
+		if s.config.baseConfig.NetworkInstance.Value == name {
 			if s.config.baseConfig.OperState == operUp {
 				s.shutdown(ctx, time.Second/2)
 			}
 		}
+	default:
+		log.Debugf("ignored network instance op %s for %q", nwInst.GetOp(), name)
 	}
+}
+
+func (s *server) applyDebug(state string) {
+	if state == "" {
+		return
+	}
+	enabled := s.config.cliDebug || state == adminEnable || state == "DEBUG_enable" || state == "enable"
+	if enabled == s.config.debug {
+		return
+	}
+	s.config.debug = enabled
+	SetDebugLogging(enabled)
+	if enabled {
+		log.Infof("debug logging enabled (config value %q)", state)
+		return
+	}
+	log.Infof("debug logging disabled (config value %q)", state)
+}
+
+func (s *server) logKnownNetworkInstances() {
+	if !s.config.debug {
+		return
+	}
+	names := make([]string, 0, len(s.config.nwInst))
+	for name := range s.config.nwInst {
+		names = append(names, name)
+	}
+	log.Debugf("known network instances: %v", names)
 }

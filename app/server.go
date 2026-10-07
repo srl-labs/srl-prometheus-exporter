@@ -20,13 +20,13 @@ import (
 	"time"
 
 	capi "github.com/hashicorp/consul/api"
-	agent "github.com/karimra/srl-ndk-demo"
 	"github.com/openconfig/gnmi/proto/gnmi"
 	"github.com/openconfig/gnmic/pkg/formatters"
 	gpath "github.com/openconfig/gnmic/pkg/path"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
+	"github.com/srl-labs/bond"
 	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -34,10 +34,11 @@ import (
 )
 
 const (
-	metricNameRegex      = "[^a-zA-Z0-9_]+"
-	serviceName          = "srl-prometheus-exporter"
-	retryInterval        = 2 * time.Second
-	gnmiServerUnixSocket = "unix:///opt/srlinux/var/run/sr_gnmi_server"
+	metricNameRegex   = "[^a-zA-Z0-9_]+"
+	serviceName       = "srl-prometheus-exporter"
+	retryInterval     = 2 * time.Second
+	gnmiSocketPrefix  = "/opt/srlinux/var/run/sr_grpc_server_"
+	defaultGRPCServer = "prometheus-exporter"
 )
 
 var sysInfoPaths = []*gnmi.Path{
@@ -87,7 +88,7 @@ var sysInfoPaths = []*gnmi.Path{
 
 type server struct {
 	config *config
-	agent  *agent.Agent
+	agent  *bond.Agent
 
 	srv         *http.Server
 	srvCancelFn context.CancelFunc
@@ -99,7 +100,7 @@ type server struct {
 
 type serverOption func(*server)
 
-func WithAgent(agt *agent.Agent) func(s *server) {
+func WithAgent(agt *bond.Agent) func(s *server) {
 	return func(s *server) {
 		s.agent = agt
 	}
@@ -138,9 +139,9 @@ func (s *server) Collect(ch chan<- prometheus.Metric) {
 	gctx, gcancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer gcancel()
 
-	conn, gnmiClient, err := createGNMIClient(gctx)
+	conn, gnmiClient, err := s.createGNMIClient(gctx)
 	if err != nil {
-		log.Errorf("failed to create a gnmi connection to %q: %v", gnmiServerUnixSocket, err)
+		log.Errorf("failed to create a gnmi connection to %q: %v", s.gnmiSocket(), err)
 		return
 	}
 	defer conn.Close()
@@ -152,12 +153,12 @@ func (s *server) Collect(ch chan<- prometheus.Metric) {
 	// get metrics that are enabled
 	metrics := make(map[string]metric, len(s.config.metrics)+len(s.config.customMetric))
 	for name, m := range s.config.metrics {
-		if m.Metric.State == stateEnable {
+		if m.Metric.State == adminEnable {
 			metrics[name] = m.Metric
 		}
 	}
 	for name, m := range s.config.customMetric {
-		if m.Metric.State == stateEnable {
+		if m.Metric.State == adminEnable {
 			metrics[name] = m.Metric
 		}
 	}
@@ -297,13 +298,14 @@ START:
 		}
 		var netInstName string
 		for {
-			if netInst, ok := s.config.nwInst[s.config.baseConfig.NetworkInstance.Value]; ok {
-				netInstName = fmt.Sprintf("%s-%s", netInst.BaseName, s.config.baseConfig.NetworkInstance.Value)
+			var ok bool
+			netInstName, ok = s.networkNamespace()
+			if ok {
 				break
-			} else {
-				log.Errorf("unknown network instance name: %s", s.config.baseConfig.NetworkInstance.Value)
-				time.Sleep(time.Second)
 			}
+			log.Errorf("unknown network instance name: %s", s.config.baseConfig.NetworkInstance.Value)
+			s.logKnownNetworkInstances()
+			time.Sleep(time.Second)
 		}
 
 		log.Debugf("using network-instance %q", netInstName)
@@ -490,13 +492,14 @@ NETNS:
 	// get network instance corresponding netns
 	var netInstName string
 	for {
-		if netInst, ok := s.config.nwInst[s.config.baseConfig.NetworkInstance.Value]; ok {
-			netInstName = fmt.Sprintf("%s-%s", netInst.BaseName, s.config.baseConfig.NetworkInstance.Value)
+		var ok bool
+		netInstName, ok = s.networkNamespace()
+		if ok {
 			break
-		} else {
-			log.Errorf("unknown network instance name: %s", s.config.baseConfig.NetworkInstance.Value)
-			time.Sleep(time.Second)
 		}
+		log.Errorf("unknown network instance name: %s", s.config.baseConfig.NetworkInstance.Value)
+		s.logKnownNetworkInstances()
+		time.Sleep(time.Second)
 	}
 	log.Infof("using network-instance name %q", netInstName)
 
@@ -683,9 +686,9 @@ START:
 	case <-sctx.Done():
 		return nil, ctx.Err()
 	default:
-		conn, gnmiClient, err := createGNMIClient(sctx)
+		conn, gnmiClient, err := s.createGNMIClient(sctx)
 		if err != nil {
-			log.Errorf("failed to create a gnmi connection to %q: %v", gnmiServerUnixSocket, err)
+			log.Errorf("failed to create a gnmi connection to %q: %v", s.gnmiSocket(), err)
 			time.Sleep(retryInterval)
 			goto START
 		}
@@ -693,8 +696,9 @@ START:
 
 		rsp, err := gnmiClient.Get(sctx,
 			&gnmi.GetRequest{
-				Path:     sysInfoPaths,
-				Type:     gnmi.GetRequest_STATE,
+				Path: sysInfoPaths,
+				// host-name is config; a STATE Get omits it on SR Linux 26.7.
+				Type:     gnmi.GetRequest_ALL,
 				Encoding: gnmi.Encoding_ASCII,
 			})
 		if err != nil {
@@ -764,11 +768,39 @@ func (h *healthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-func createGNMIClient(ctx context.Context) (*grpc.ClientConn, gnmi.GNMIClient, error) {
+func (s *server) networkNamespace() (string, bool) {
+	name := s.config.baseConfig.NetworkInstance.Value
+	if name == "" {
+		return "", false
+	}
+	if netInst, ok := s.config.nwInst[name]; ok && netInst.GetBaseName() != "" {
+		return fmt.Sprintf("%s-%s", netInst.GetBaseName(), name), true
+	}
+	// SR Linux names the namespace srbase-<network-instance>. Use it when the
+	// NDK notification has not arrived; mgmt is srbase-mgmt.
+	fallback := "srbase-" + name
+	ns, err := netns.GetFromName(fallback)
+	if err != nil {
+		return "", false
+	}
+	ns.Close()
+	log.Infof("network instance %q has no NDK notification; using namespace %s", name, fallback)
+	return fallback, true
+}
+
+func (s *server) gnmiSocket() string {
+	name := s.config.baseConfig.GRPCServer.Value
+	if name == "" {
+		name = defaultGRPCServer
+	}
+	return "unix://" + gnmiSocketPrefix + name
+}
+
+func (s *server) createGNMIClient(ctx context.Context) (*grpc.ClientConn, gnmi.GNMIClient, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, retryInterval)
 	defer cancel()
 	conn, err := grpc.DialContext(timeoutCtx,
-		gnmiServerUnixSocket,
+		s.gnmiSocket(),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 	)
