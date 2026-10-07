@@ -6,6 +6,23 @@ Originally created by [Karim Radhouani](https://github.com/karimra/srl-prometheu
 
 Version 0.3.0 targets SR Linux 26.7 and is not compatible with 0.2.x.
 
+```mermaid
+flowchart LR
+  subgraph srl [SR Linux]
+    mgr[app_mgr]
+    ndk[NDK server]
+    gnmi[gNMI server]
+    app[prometheus-exporter]
+    mgr -->|launch and config| app
+    app -->|config and oper-state| ndk
+    app -->|metric paths| gnmi
+  end
+  prom[Prometheus] -->|scrape /metrics| app
+  consul[Consul] -.->|optional| app
+```
+
+`app_mgr` launches the app and delivers its YANG config through the NDK server. The app reads metric state from gNMI and serves it on `/metrics`. Prometheus scrapes that endpoint. Consul registration is optional.
+
 ### Installation
 
 Copy the `.deb` from the [releases](https://github.com/srl-labs/srl-prometheus-exporter/releases) (x86_64 or arm64) onto the node and install it:
@@ -33,7 +50,7 @@ The CPM filter must also accept the exporter port. `scripts/setup-node.sh` appli
 scripts/setup-node.sh --target 192.0.2.10:57400 --metric interfaces --enable
 ```
 
-[labs/clab](labs/clab/README.md) has a containerlab lab and a Prometheus, Consul, and Grafana stack for real nodes.
+[labs/clab](labs/clab/README.md) has a containerlab lab and a Prometheus, Consul, and Grafana telemetry stack for testing.
 
 ### Configuration
 
