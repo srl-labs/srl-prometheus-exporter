@@ -8,13 +8,12 @@ import (
 	"syscall"
 	"time"
 
-	agent "github.com/karimra/srl-ndk-demo"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
-	"google.golang.org/grpc/metadata"
+	"github.com/srl-labs/bond"
 	"gopkg.in/yaml.v2"
 
-	"github.com/karimra/srl-prometheus-exporter/app"
+	"github.com/srl-labs/srl-prometheus-exporter/app"
 )
 
 const (
@@ -42,8 +41,7 @@ func main() {
 		return
 	}
 	if debug {
-		log.SetLevel(log.DebugLevel)
-		log.SetReportCaller(true)
+		app.SetDebugLogging(true)
 	}
 	retryCount := 0
 READFILE:
@@ -76,18 +74,28 @@ READFILE:
 	ctx, cancel := context.WithCancel(context.Background())
 	setupCloseHandler(cancel)
 
-	ctx = metadata.AppendToOutgoingContext(ctx, "agent_name", agentName)
+	zl := app.NewBondLogger()
 
 	retryCount = 0
 CRAGENT:
-	agt, err := agent.New(ctx, agentName)
-	if err != nil {
+	agt, errs := bond.NewAgent(agentName,
+		bond.WithContext(ctx, cancel),
+		bond.WithLogger(&zl),
+		bond.WithAppRootPath("/system/prometheus-exporter"),
+		bond.WithStreamConfig(),
+	)
+	if len(errs) > 0 {
+		log.Errorf("failed to create agent %q: %v", agentName, errs)
+		os.Exit(1)
+	}
+	if err := agt.Start(); err != nil {
 		if retryCount >= maxRetries {
-			log.Errorf("ailed to create agent: max retries reached: %v", err)
+			log.Errorf("failed to start agent: max retries reached: %v", err)
 			os.Exit(1)
 		}
-		log.Errorf("failed to create agent %q: %v", agentName, err)
+		log.Errorf("failed to start agent %q: %v", agentName, err)
 		log.Infof("retrying in %s", retryInterval)
+		retryCount++
 		time.Sleep(retryInterval)
 		goto CRAGENT
 	}

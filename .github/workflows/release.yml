@@ -6,7 +6,7 @@ on:
       - v*
 
 env:
-  GOVER: 1.21.3
+  GOVER: "1.22.0"
   GORELEASER_VER: v1.22.1
 
 jobs:
@@ -30,10 +30,6 @@ jobs:
       - uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GOVER }}
-      - name: Configure git for private modules
-        env:
-          TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
-        run: git config --global url."https://karimra:${TOKEN}@github.com".insteadOf "https://github.com"
       - name: Release with goreleaser
         uses: goreleaser/goreleaser-action@v5
         with:

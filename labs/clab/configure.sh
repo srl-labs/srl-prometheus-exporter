@@ -1,57 +1,52 @@
 #!/bin/bash
 
-# credentials
-username=admin
-password=NokiaSrl1!
+set -euo pipefail
 
-# build comma separated srl nodes names
-nodes=$(docker ps -f label=clab-node-kind=srl -f label=containerlab=prom-exporter --format {{.Names}} | paste -s -d, -)
+source "$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)/common.sh"
 
-gnmic_args="-u $username -p $password -a $nodes --skip-verify"
+usage() {
+    cat <<'EOF'
+Usage: configure.sh
 
-# script path
-SCRIPTPATH="$( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )"
+Configure the SR Linux nodes in a lab that is already running.
 
-# configure app prerequisites, gNMI UDS and ACLs
-gnmic $gnmic_args set --request-file config/app/config.yaml
+Runs scripts/setup-node.sh on each node with Consul registration, the
+interfaces and subinterfaces metrics, and admin-state enable. That is the same
+command used on a hardware node. Then applies config/interfaces/vars.yaml.
 
-# load basic nodes config, p2p links
-gnmic $gnmic_args set --request-file config/interfaces/template.gotmpl --request-vars config/interfaces/vars.yaml
+  -h, --help  Show this help
+EOF
+}
 
-# check the app config, it should be admin down and oper down
-gnmic $gnmic_args -e json_ietf \
-                get \
-                --path /system/prometheus-exporter
+case "${1:-}" in
+    "" ) ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+esac
 
-# enable metrics "interfaces" and "subinterfaces"
-gnmic $gnmic_args -e json_ietf \
-                set \
-                --update-path /system/prometheus-exporter/metric[name=interfaces]/state \
-                --update-value enable \
-                --update-path /system/prometheus-exporter/metric[name=subinterfaces]/state \
-                --update-value enable
+cd "$lab_dir"
+lab_proxy_env
 
-# enable consul registration
-## get consul agent IP
-consul_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' clab-prom-exporter-consul-agent)
-echo "consul IP address:" ${consul_ip}
+ip_of() {
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "clab-${lab_name}-$1" | awk '{print $1}'
+}
 
-gnmic $gnmic_args -e json_ietf \
-                set \
-                --update-path /system/prometheus-exporter/registration/address \
-                --update-value ${consul_ip}:8500 \
-                --update-path /system/prometheus-exporter/registration/admin-state \
-                --update-value enable
+consul_ip=$(ip_of consul-agent)
+for node in srl1 srl2; do
+    "$lab_dir/../../scripts/setup-node.sh" \
+        --target "$(ip_of "$node"):57400" \
+        --username "$username" \
+        --password "$password" \
+        --consul "${consul_ip}:8500" \
+        --metric interfaces \
+        --metric subinterfaces \
+        --enable
+done
 
-# enable the prometheus exporter app
-gnmic $gnmic_args -e json_ietf \
-                set \
-                --update-path /system/prometheus-exporter/admin-state \
-                --update-value enable
+nodes="clab-${lab_name}-srl1,clab-${lab_name}-srl2"
+gnmic -u "$username" -p "$password" -a "$nodes" --skip-verify --encoding json_ietf --timeout 2m \
+    set --request-file config/interfaces/template.gotmpl --request-vars config/interfaces/vars.yaml
 
-# check that the SRLs prometheus endpoint is UP
-curl -sSL clab-prom-exporter-srl1:8888/metrics
-curl -sSL clab-prom-exporter-srl2:8888/metrics
-
-# navigate to the prometheus server GUI on <your serverIP>:9090/targets
-# you should see that both SRL prometheus exporters are UP and being scraped by Prometheus
+for node in srl1 srl2; do
+    echo "$node: $(curl -fsS "clab-${lab_name}-${node}:8888/metrics" | grep -vc '^#') samples"
+done

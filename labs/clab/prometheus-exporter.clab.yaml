@@ -5,9 +5,20 @@ mgmt:
   ipv4-subnet: 172.80.80.0/24      
 
 topology:
+  # run.sh fills these from the host environment. Empty when no proxy is set.
+  defaults:
+    env:
+      http_proxy: ${http_proxy:-}
+      https_proxy: ${https_proxy:-}
+      ftp_proxy: ${ftp_proxy:-}
+      no_proxy: ${no_proxy:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      FTP_PROXY: ${FTP_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
   kinds:
     srl:
-      image: ghcr.io/nokia/srlinux:latest
+      image: ghcr.io/nokia/srlinux:26.7.2
       binds:
         - ./app:/tmp/pkg:ro
 
@@ -27,7 +38,7 @@ topology:
       image: prom/prometheus:latest
       user: 65534:65534 
       ports:
-        - 9090:9090
+        - 9095:9090
       binds:
         - ./prometheus/:/etc/prometheus/
         #- ./prometheus/storage:/prometheus
@@ -40,7 +51,7 @@ topology:
 
     consul-agent:
       kind: linux
-      image: consul:latest
+      image: hashicorp/consul:latest
       ports:
         - 8500:8500
         - 8600:8600/udp

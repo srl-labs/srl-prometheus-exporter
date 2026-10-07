@@ -11,6 +11,12 @@ module prometheus-exporter {
     import srl_nokia-system {
         prefix srl-system;
     }
+    import srl_nokia-ndk {
+        prefix srl-ndk;
+    }
+    import srl_nokia-grpc {
+        prefix srl-grpc;
+    }
     import srl_nokia-network-instance {
         prefix srl-netinst;
     }
@@ -26,6 +32,10 @@ module prometheus-exporter {
         "This module defines configuration and operational state data related to the SRLinux Prometheus Exporter.";
 
     // revision(s)
+    revision "2026-10-07" {
+        description
+          "prometheus-exporter 0.3.0. Breaking: SRL 26.7 metric paths and NDK v0.5 via srl-labs/bond.";
+    }
     revision "2026-03-05" {
         description
           "prometheus-exporter 0.2.15";
@@ -45,13 +55,26 @@ module prometheus-exporter {
                 type srl-comm:ip-address;
                 default "::";
                 srl-ext:show-importance high;
-                description "IP Address the prometheus exporter server listens on";
+                description
+                    "IP address the Prometheus exporter server listens on.
+
+                     The operator must ensure that the IPv4 and/or IPv6 ACL
+                     filter applied under system control-plane-traffic input
+                     permits TCP traffic to the configured port.";
             }
             leaf port {
                 type srl-comm:port-number;
                 default "8888";
                 srl-ext:show-importance high;
-                description "Port number the prometheus exporter server listens on";
+                description
+                    "Port number the Prometheus exporter server listens on.
+
+                     The exporter does not create or modify CPM ACL filters.
+                     Define an ACL entry under acl acl-filter that accepts TCP
+                     traffic to this destination port, then bind that filter
+                     under system control-plane-traffic input acl. Configure
+                     both IPv4 and IPv6 filters when clients use both address
+                     families.";
             }
             leaf network-instance {
                 type leafref {
@@ -60,8 +83,11 @@ module prometheus-exporter {
                 srl-ext:show-importance high;
                 default "mgmt";
                 description
-                    "Reference to a configured network-instance used to send out telemetry updates
-                    This network-instance must already exist in the system.";
+                    "Reference to the configured network-instance in which the
+                     exporter HTTP listener runs. This network-instance must
+                     already exist. Selecting it does not create or modify the
+                     global IPv4 or IPv6 CPM ACL filters required to reach the
+                     configured listener port.";
             }
             leaf tls-profile {
                 type leafref {
@@ -80,8 +106,50 @@ module prometheus-exporter {
             leaf admin-state {
                 type srl-comm:admin-state;
                 default "disable";
+                must ". = 'disable' or /srl-system:system/srl-ndk:ndk-server/srl-ndk:admin-state = 'enable'" {
+                    error-message
+                      "The NDK server must be enabled before enabling the Prometheus exporter";
+                }
+                must ". = 'disable' or /srl-system:system/srl-grpc:grpc-server[srl-grpc:name = current()/../grpc-server]/srl-grpc:admin-state = 'enable'" {
+                    error-message
+                      "The grpc-server referenced by grpc-server must exist and be enabled";
+                }
+                must ". = 'disable' or /srl-system:system/srl-grpc:grpc-server[srl-grpc:name = current()/../grpc-server]/srl-grpc:unix-socket/srl-grpc:admin-state = 'enable'" {
+                    error-message
+                      "The grpc-server referenced by grpc-server must have unix-socket admin-state enable";
+                }
+                must ". = 'disable' or not(/srl-system:system/srl-grpc:grpc-server[srl-grpc:name = current()/../grpc-server]/srl-grpc:unix-socket/srl-grpc:socket-filename)" {
+                    error-message
+                      "The grpc-server referenced by grpc-server must not set unix-socket socket-filename";
+                }
                 srl-ext:show-importance high;
                 description "Administrative state of the exporter";
+            }
+            leaf grpc-server {
+                type leafref {
+                    path "/srl-system:system/srl-grpc:grpc-server/srl-grpc:name";
+                    require-instance false;
+                }
+                default "prometheus-exporter";
+                srl-ext:show-importance high;
+                description
+                  "gRPC server whose unix socket the exporter uses for gNMI.
+
+                   The exporter connects to
+                   /opt/srlinux/var/run/sr_grpc_server_<grpc-server>. The server
+                   must be enabled, enable its unix-socket, and leave
+                   socket-filename unset. It must also include the gnmi
+                   service; that is not checked at commit.";
+            }
+            leaf debug {
+                type srl-comm:admin-state;
+                default "disable";
+                description
+                  "Enable debug logging in the exporter process.
+
+                   The default is disable. When enabled, configuration and
+                   network-instance notifications are logged. The change
+                   applies on commit without restarting the process.";
             }
             leaf oper-state {
                 type srl-comm:oper-state;
@@ -112,7 +180,7 @@ module prometheus-exporter {
                         enum udp;
                     }
                 }
-                leaf state {
+                leaf admin-state {
                     type srl-comm:admin-state;
                     default "disable";
                     srl-ext:show-importance high;
@@ -143,7 +211,7 @@ module prometheus-exporter {
                     type string;
                     description "gNMI xpaths used to subscribe for updates exposed by this custom metric";
                 }
-                leaf state {
+                leaf admin-state {
                     type srl-comm:admin-state;
                     default "disable";
                     srl-ext:show-importance high;
