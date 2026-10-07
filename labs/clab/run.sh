@@ -15,7 +15,7 @@ the nodes. See README.md for how this differs from a hardware node.
   stack       Deploy only Prometheus, Consul, and Grafana, for a hardware node
   -h, --help  Show this help
 
-With no argument, run.sh downloads the published v0.3.0 amd64 deb. That asset is not on the release yet; use build.
+With no argument, run.sh downloads the published v0.3.1 amd64 deb. That asset is not on the release yet; use build.
 
 If http_proxy, https_proxy, or ftp_proxy is set (uppercase names work too),
 those values are passed into every lab container. Lab node names are added to

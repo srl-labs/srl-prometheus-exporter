@@ -3,7 +3,7 @@
 lab_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 topo="$lab_dir/prometheus-exporter.clab.yaml"
 lab_name=prom-exporter
-version=0.3.0
+version=0.3.1
 username=admin
 password='NokiaSrl1!'
 deb_name="srl-prometheus-exporter_${version}_Linux_x86_64.deb"

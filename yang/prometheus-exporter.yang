@@ -32,6 +32,10 @@ module prometheus-exporter {
         "This module defines configuration and operational state data related to the SRLinux Prometheus Exporter.";
 
     // revision(s)
+    revision "2026-10-08" {
+        description
+          "prometheus-exporter 0.3.1. Remote write from a gNMI SAMPLE subscription.";
+    }
     revision "2026-10-07" {
         description
           "prometheus-exporter 0.3.0. Breaking: SRL 26.7 metric paths and NDK v0.5 via srl-labs/bond.";
@@ -51,30 +55,43 @@ module prometheus-exporter {
     grouping prometheus-exporter-top {
         container prometheus-exporter {
             //presence "prometheus-exporter";
-            leaf address {
-                type srl-comm:ip-address;
-                default "::";
-                srl-ext:show-importance high;
+            container scrape {
                 description
-                    "IP address the Prometheus exporter server listens on.
-
-                     The operator must ensure that the IPv4 and/or IPv6 ACL
-                     filter applied under system control-plane-traffic input
-                     permits TCP traffic to the configured port.";
-            }
-            leaf port {
-                type srl-comm:port-number;
-                default "8888";
-                srl-ext:show-importance high;
-                description
-                    "Port number the Prometheus exporter server listens on.
-
-                     The exporter does not create or modify CPM ACL filters.
-                     Define an ACL entry under acl acl-filter that accepts TCP
-                     traffic to this destination port, then bind that filter
-                     under system control-plane-traffic input acl. Configure
-                     both IPv4 and IPv6 filters when clients use both address
-                     families.";
+                  "HTTP listener Prometheus scrapes. Disable admin-state to use remote-write only.";
+                leaf admin-state {
+                    type srl-comm:admin-state;
+                    default "enable";
+                    description "Administrative state of the scrape listener.";
+                }
+                leaf address {
+                    type srl-comm:ip-address;
+                    default "::";
+                    srl-ext:show-importance high;
+                    description
+                      "IP address the scrape listener uses. The CPM filter must permit TCP to the port.";
+                }
+                leaf port {
+                    type srl-comm:port-number;
+                    default "8888";
+                    srl-ext:show-importance high;
+                    description "TCP port of the scrape listener.";
+                }
+                leaf http-path {
+                    type string;
+                    default "/metrics";
+                    srl-ext:show-importance high;
+                    description "HTTP path Prometheus scrapes.";
+                }
+                leaf oper-state {
+                    type srl-comm:oper-state;
+                    config false;
+                    description "Operational state of the scrape listener.";
+                }
+                leaf scrapes-count {
+                    config false;
+                    type srl-comm:zero-based-counter64;
+                    description "Number of scrapes received.";
+                }
             }
             leaf network-instance {
                 type leafref {
@@ -83,11 +100,7 @@ module prometheus-exporter {
                 srl-ext:show-importance high;
                 default "mgmt";
                 description
-                    "Reference to the configured network-instance in which the
-                     exporter HTTP listener runs. This network-instance must
-                     already exist. Selecting it does not create or modify the
-                     global IPv4 or IPv6 CPM ACL filters required to reach the
-                     configured listener port.";
+                    "Network-instance used by the scrape listener and by remote write.";
             }
             leaf tls-profile {
                 type leafref {
@@ -95,13 +108,10 @@ module prometheus-exporter {
                 }
                 srl-ext:show-importance high;
                 description
-                  "Reference to the TLS profile to use on the prometheus server";
-            }
-            leaf http-path {
-                type string;
-                default "/metrics";
-                srl-ext:show-importance high;
-                description "HTTP path the prometheus client needs to scrape to get the metrics";
+                  "TLS profile for the scrape listener and for remote write when the URL is https.
+
+                   The profile certificate and key are presented by the listener and by the
+                   remote-write client. The profile trust anchor verifies the remote-write server.";
             }
             leaf admin-state {
                 type srl-comm:admin-state;
@@ -155,7 +165,7 @@ module prometheus-exporter {
                 type srl-comm:oper-state;
                 config false;
                 srl-ext:show-importance high;
-                description "Operational state of the exporter";
+                description "Operational state of the exporter application.";
             }
             list metric {
                 description "Predefined metrics to be exposed on the prometheus exporter server";
@@ -223,10 +233,62 @@ module prometheus-exporter {
                     description "Prometheus metric help text";
                 }
             } // list custom-metric
-            leaf scrapes-count {
-                config false;
-                type srl-comm:zero-based-counter64;
-                description "Number of scrapes received by the prometheus server";
+            container remote-write {
+                description
+                  "Push samples to a Prometheus remote-write endpoint.
+
+                   The exporter opens a gNMI STREAM subscription in SAMPLE mode.
+                   sample-interval is the interval leaf. Each sample is posted
+                   to url. The CPM filter must accept TCP replies whose source
+                   port is the remote-write server port.";
+                leaf url {
+                    type string;
+                    description
+                      "Remote-write endpoint, for example http://192.0.2.1:9090/api/v1/write.";
+                }
+                leaf interval {
+                    type string;
+                    default "15s";
+                    description
+                      "gNMI sample interval. Samples are written on this interval.";
+                }
+                leaf timeout {
+                    type string;
+                    default "30s";
+                    description "HTTP timeout for one remote-write POST.";
+                }
+                leaf username {
+                    type string;
+                    description "Basic-auth username. Leave unset for no authentication.";
+                }
+                leaf password {
+                    type string;
+                    description "Basic-auth password.";
+                }
+                leaf admin-state {
+                    type srl-comm:admin-state;
+                    default "disable";
+                    must ". = 'disable' or ../url" {
+                        error-message
+                          "remote-write url is required when remote-write is enabled";
+                    }
+                    description "Administrative state of remote write.";
+                }
+                leaf oper-state {
+                    type srl-comm:oper-state;
+                    config false;
+                    description "Operational state of remote write.";
+                }
+                leaf writes-count {
+                    config false;
+                    type srl-comm:zero-based-counter64;
+                    description "Number of successful remote-write posts.";
+                }
+                leaf last-error {
+                    config false;
+                    type string;
+                    description "Last remote-write error. Empty after a successful post.";
+                }
             }
             container registration {
                 leaf address {

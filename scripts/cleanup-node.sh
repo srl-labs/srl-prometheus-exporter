@@ -14,7 +14,7 @@ usage() {
 Usage: cleanup-node.sh --target HOST:PORT [options]
 
 Remove the IPv4 and IPv6 CPM ACL entries created by setup-node.sh
-(<sequence-id> and <sequence-id>+1). The shared ACL filters, their
+(<sequence-id>, <sequence-id>+1, and <sequence-id>+2). The shared ACL filters, their
 control-plane bindings, the NDK server, and grpc-server prometheus-exporter
 are not removed.
 
@@ -75,13 +75,14 @@ if [[ -z "$target" ]]; then
     echo "--target or SRL_TARGET is required" >&2
     exit 2
 fi
-if [[ ! "$sequence_id" =~ ^[0-9]+$ ]] || ((sequence_id > 65534)); then
-    echo "sequence ID must be between 0 and 65534" >&2
+if [[ ! "$sequence_id" =~ ^[0-9]+$ ]] || ((sequence_id > 65533)); then
+    echo "sequence ID must be between 0 and 65533" >&2
     exit 2
 fi
 
 acl="/acl/acl-filter[name=${filter_name}]"
 consul_seq=$((sequence_id + 1))
+remote_write_seq=$((sequence_id + 2))
 
 docker run --rm --network host "$image" \
     --address "$target" \
@@ -94,4 +95,6 @@ docker run --rm --network host "$image" \
     --delete "${acl}[type=ipv4]/entry[sequence-id=${sequence_id}]" \
     --delete "${acl}[type=ipv6]/entry[sequence-id=${sequence_id}]" \
     --delete "${acl}[type=ipv4]/entry[sequence-id=${consul_seq}]" \
-    --delete "${acl}[type=ipv6]/entry[sequence-id=${consul_seq}]"
+    --delete "${acl}[type=ipv6]/entry[sequence-id=${consul_seq}]" \
+    --delete "${acl}[type=ipv4]/entry[sequence-id=${remote_write_seq}]" \
+    --delete "${acl}[type=ipv6]/entry[sequence-id=${remote_write_seq}]"
