@@ -74,16 +74,22 @@ A:srl1# info detail
     network-instance mgmt
     admin-state enable
     grpc-server prometheus-exporter
+    debug disable
     scrape {
         admin-state enable
         address ::
         port 8888
         http-path /metrics
     }
-    debug disable
     metric interfaces {
         admin-state enable
         help-text "SRLinux generated metric"
+    }
+    remote-write {
+        url http://192.0.2.1:9090/api/v1/write
+        interval 15s
+        timeout 30s
+        admin-state enable
     }
 ```
 
