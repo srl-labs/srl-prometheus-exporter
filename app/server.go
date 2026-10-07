@@ -588,7 +588,6 @@ INITCONSUL:
 			return (&net.Dialer{
 				Timeout:   5 * time.Second,
 				KeepAlive: 5 * time.Second,
-				DualStack: true,
 			}).DialContext(ctx, network, address)
 		},
 	}
