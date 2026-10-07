@@ -10,9 +10,9 @@ Usage: configure.sh
 
 Configure the SR Linux nodes in a lab that is already running.
 
-Runs scripts/setup-node.sh on each node with Consul registration, the
-interfaces and subinterfaces metrics, and admin-state enable. That is the same
-command used on a hardware node. Then applies config/interfaces/vars.yaml.
+Runs scripts/setup-node.sh on each node with Consul registration, remote
+write to the lab Prometheus, the interfaces and subinterfaces metrics, and
+admin-state enable. Then applies config/interfaces/vars.yaml.
 
   -h, --help  Show this help
 EOF
@@ -32,12 +32,14 @@ ip_of() {
 }
 
 consul_ip=$(ip_of consul-agent)
+prometheus_ip=$(ip_of prometheus)
 for node in srl1 srl2; do
     "$lab_dir/../../scripts/setup-node.sh" \
         --target "$(ip_of "$node"):57400" \
         --username "$username" \
         --password "$password" \
         --consul "${consul_ip}:8500" \
+        --remote-write "http://${prometheus_ip}:9090/api/v1/write" \
         --metric interfaces \
         --metric subinterfaces \
         --enable

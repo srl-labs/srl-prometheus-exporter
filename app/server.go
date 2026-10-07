@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,9 +92,15 @@ type server struct {
 	config *config
 	agent  *bond.Agent
 
-	srv         *http.Server
-	srvCancelFn context.CancelFunc
-	regCancelFn context.CancelFunc
+	srv           *http.Server
+	srvCancelFn   context.CancelFunc
+	regCancelFn   context.CancelFunc
+	rwCancelFn    context.CancelFunc
+	rwGen         uint64
+	rwURL         string
+	rwInterval    string
+	rwProfile     string
+	scrapeProfile string
 	//
 	consulClient *capi.Client
 	metricRegex  *regexp.Regexp
@@ -131,7 +138,10 @@ func (s *server) Describe(ch chan<- *prometheus.Desc) {}
 
 // Collect implements prometheus.Collector
 func (s *server) Collect(ch chan<- prometheus.Metric) {
-	atomic.AddUint64(&s.config.baseConfig.ScrapesCount.Value, 1)
+	if s.config.baseConfig.Scrape == nil {
+		s.config.baseConfig.Scrape = &scrapeConfig{}
+	}
+	atomic.AddUint64(&s.config.baseConfig.Scrape.ScrapesCount.Value, 1)
 	statsCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	statsCtx = metadata.AppendToOutgoingContext(statsCtx, "agent_name", s.config.agentName)
@@ -182,7 +192,7 @@ func (s *server) Collect(ch chan<- prometheus.Metric) {
 		go func(name string, m metric) {
 			defer wg.Done()
 			log.Debugf("collecting metric %q", name)
-			req, err := s.createSubscribeRequest(name)
+			req, err := s.createSubscribeRequest(name, m, gnmi.SubscriptionList_ONCE, 0)
 			if err != nil {
 				return
 			}
@@ -280,18 +290,32 @@ START:
 				ErrorHandling: promhttp.ContinueOnError,
 			})
 
-		mux := http.NewServeMux()
-		if s.config.baseConfig.HttpPath.Value == "" {
-			s.config.baseConfig.HttpPath.Value = "/"
+		sc := s.config.baseConfig.Scrape
+		if sc == nil {
+			sc = &scrapeConfig{}
+			s.config.baseConfig.Scrape = sc
 		}
-		mux.Handle(s.config.baseConfig.HttpPath.Value, promHandler)
+		httpPath := sc.HttpPath.Value
+		if httpPath == "" {
+			httpPath = "/metrics"
+		}
+		address := sc.Address.Value
+		if address == "" {
+			address = "::"
+		}
+		port := sc.Port.Value
+		if port == "" {
+			port = "8888"
+		}
+		mux := http.NewServeMux()
+		mux.Handle(httpPath, promHandler)
 		mux.Handle("/", new(healthHandler))
 
 		var addr string
-		if strings.Contains(s.config.baseConfig.Address.Value, ":") {
-			addr = fmt.Sprintf("[%s]:%s", s.config.baseConfig.Address.Value, s.config.baseConfig.Port.Value)
+		if strings.Contains(address, ":") {
+			addr = fmt.Sprintf("[%s]:%s", address, port)
 		} else {
-			addr = fmt.Sprintf("%s:%s", s.config.baseConfig.Address.Value, s.config.baseConfig.Port.Value)
+			addr = fmt.Sprintf("%s:%s", address, port)
 		}
 		s.srv = &http.Server{
 			Addr:    addr,
@@ -334,16 +358,33 @@ START:
 			goto START
 		}
 
+		serveLn := listener
+		if profile := s.config.baseConfig.TLSProfile.Value; profile != "" {
+			tlsCfg, tlsErr := loadTLSConfig(profile)
+			if tlsErr != nil || len(tlsCfg.Certificates) == 0 {
+				if tlsErr == nil {
+					tlsErr = fmt.Errorf("tls profile %s has no certificate", profile)
+				}
+				log.Errorf("scrape tls: %v", tlsErr)
+				sc.OperState = operFailed
+				listener.Close()
+				time.Sleep(retryInterval)
+				goto START
+			}
+			serveLn = tls.NewListener(listener, tlsCfg)
+		}
+
 		// start http server
 		log.Infof("starting http server on %s", s.srv.Addr)
 		s.config.baseConfig.OperState = operUp
+		sc.OperState = operUp
 		s.updatePrometheusBaseTelemetry(ctx, s.config.baseConfig)
 
 		go func() {
-			err = s.srv.Serve(listener)
+			err = s.srv.Serve(serveLn)
 			if err != nil && err != http.ErrServerClosed {
 				log.Errorf("prometheus server error: %v", err)
-				s.config.baseConfig.OperState = operDown
+				sc.OperState = operDown
 				go s.updatePrometheusBaseTelemetry(sctx, s.config.baseConfig)
 			}
 			log.Infof("http server closed...")
@@ -353,14 +394,13 @@ START:
 }
 
 // assumes config is already locked
-func (s *server) createSubscribeRequest(metricName string) (*gnmi.SubscribeRequest, error) {
+func (s *server) createSubscribeRequest(metricName string, m metric, mode gnmi.SubscriptionList_Mode, sampleInterval time.Duration) (*gnmi.SubscribeRequest, error) {
 	var paths []string
-	if _, ok := s.config.metrics[metricName]; ok {
-		paths = make([]string, 0, len(knownMetrics[metricName]))
+	if _, ok := knownMetrics[metricName]; ok {
 		paths = append(paths, knownMetrics[metricName]...)
-	} else if _, ok := s.config.customMetric[metricName]; ok {
-		paths = make([]string, 0, len(s.config.customMetric[metricName].Metric.Paths))
-		for _, value := range s.config.customMetric[metricName].Metric.Paths {
+	} else if len(m.Paths) > 0 {
+		paths = make([]string, 0, len(m.Paths))
+		for _, value := range m.Paths {
 			paths = append(paths, value.Value)
 		}
 	} else {
@@ -376,12 +416,17 @@ func (s *server) createSubscribeRequest(metricName string) (*gnmi.SubscribeReque
 		if err != nil {
 			return nil, fmt.Errorf("metric %q, path %q parse error: %v", metricName, p, err)
 		}
-		subscriptions[i] = &gnmi.Subscription{Path: gnmiPath}
+		sub := &gnmi.Subscription{Path: gnmiPath}
+		if mode == gnmi.SubscriptionList_STREAM {
+			sub.Mode = gnmi.SubscriptionMode_SAMPLE
+			sub.SampleInterval = uint64(sampleInterval.Nanoseconds())
+		}
+		subscriptions[i] = sub
 	}
 	return &gnmi.SubscribeRequest{
 		Request: &gnmi.SubscribeRequest_Subscribe{
 			Subscribe: &gnmi.SubscriptionList{
-				Mode:         gnmi.SubscriptionList_ONCE,
+				Mode:         mode,
 				Encoding:     gnmi.Encoding_JSON_IETF,
 				Subscription: subscriptions,
 			},
@@ -448,22 +493,37 @@ func (s *server) metricName(name, valueName string) string {
 	return strings.TrimLeft(s.metricRegex.ReplaceAllString(valueName, "_"), "_")
 }
 
-func (s *server) shutdown(ctx context.Context, timeout time.Duration) {
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
+func (s *server) stopListenerLocked() {
 	if s.srvCancelFn != nil {
-		// stop any running registration goroutine
 		s.srvCancelFn()
+		s.srvCancelFn = nil
+	}
+	if s.config.baseConfig.Registration != nil {
 		s.config.baseConfig.Registration.OperState = operDown
 	}
-	if s.srv != nil {
-		err := s.srv.Shutdown(cctx)
-		if err != nil {
-			log.Errorf("failed to shutdown prometheus server: %v", err)
-		} else {
-			log.Infof("prometheus server shutdown...")
-		}
+	srv := s.srv
+	s.srv = nil
+	if srv != nil {
+		go srv.Shutdown(context.Background())
+		log.Infof("scrape listener stopped")
+	}
+}
+
+func (s *server) scrapeScheme() string {
+	if s.config.baseConfig.TLSProfile.Value != "" {
+		return "https"
+	}
+	return "http"
+}
+
+func (s *server) shutdown(ctx context.Context, _ time.Duration) {
+	s.stopListenerLocked()
+	s.cancelRemoteWriteLocked()
+	if s.config.baseConfig.RemoteWrite != nil {
+		s.config.baseConfig.RemoteWrite.OperState = operDown
+	}
+	if s.config.baseConfig.Scrape != nil {
+		s.config.baseConfig.Scrape.OperState = operDown
 	}
 	s.config.baseConfig.OperState = operDown
 	s.updatePrometheusBaseTelemetry(ctx, s.config.baseConfig)
@@ -574,7 +634,11 @@ INITCONSUL:
 		addr = systemInfo.IPAddrV6
 	}
 
-	port, _ := strconv.Atoi(s.config.baseConfig.Port.Value)
+	portValue := "8888"
+	if s.config.baseConfig.Scrape != nil && s.config.baseConfig.Scrape.Port.Value != "" {
+		portValue = s.config.baseConfig.Scrape.Port.Value
+	}
+	port, _ := strconv.Atoi(portValue)
 
 	tags := make([]string, 0, len(s.config.baseConfig.Registration.Tags)+6)
 	for _, t := range s.config.baseConfig.Registration.Tags {
@@ -606,7 +670,7 @@ INITCONSUL:
 	ttlCheckID := "service:" + systemInfo.Name
 	if s.config.baseConfig.Registration.HTTPCheck.Value {
 		service.Checks = append(service.Checks, &capi.AgentServiceCheck{
-			HTTP:                           fmt.Sprintf("http://%s:%s", addr, s.config.baseConfig.Port.Value),
+			HTTP:                           fmt.Sprintf("%s://%s:%s", s.scrapeScheme(), addr, portValue),
 			Method:                         "GET",
 			Interval:                       s.config.baseConfig.Registration.TTL.Value,
 			TLSSkipVerify:                  true,

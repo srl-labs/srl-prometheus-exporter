@@ -109,12 +109,26 @@ type baseConfig struct {
 	Debug           string        `json:"debug,omitempty"`
 	OperState       string        `json:"oper_state,omitempty"`
 	NetworkInstance stringValue   `json:"network_instance,omitempty"`
-	Address         stringValue   `json:"address,omitempty"`
-	Port            stringValue   `json:"port,omitempty"`
-	HttpPath        stringValue   `json:"http_path,omitempty"`
+	TLSProfile      stringValue   `json:"tls_profile,omitempty"`
 	GRPCServer      stringValue   `json:"grpc_server,omitempty"`
-	ScrapesCount    uint64Value   `json:"scrapes_count,omitempty"`
+	Scrape          *scrapeConfig `json:"scrape,omitempty"`
+	RemoteWrite     *remoteWrite  `json:"remote_write,omitempty"`
 	Registration    *registration `json:"registration,omitempty"`
+}
+
+// scrapeOn reports whether the HTTP listener should run.
+// The YANG default is enable, including when the container is omitted.
+func scrapeOn(sc *scrapeConfig) bool {
+	return sc == nil || sc.AdminState == "" || sc.AdminState == adminEnable
+}
+
+type scrapeConfig struct {
+	AdminState   string      `json:"admin_state,omitempty"`
+	Address      stringValue `json:"address,omitempty"`
+	Port         stringValue `json:"port,omitempty"`
+	HttpPath     stringValue `json:"http_path,omitempty"`
+	OperState    string      `json:"oper_state,omitempty"`
+	ScrapesCount uint64Value `json:"scrapes_count,omitempty"`
 }
 
 type metricConfig struct {
@@ -129,6 +143,18 @@ type metric struct {
 	State    string        `json:"admin_state,omitempty"`
 	HelpText stringValue   `json:"help_text,omitempty"`
 	Paths    []stringValue `json:"paths,omitempty"`
+}
+
+type remoteWrite struct {
+	URL         stringValue `json:"url,omitempty"`
+	Interval    stringValue `json:"interval,omitempty"`
+	Timeout     stringValue `json:"timeout,omitempty"`
+	Username    stringValue `json:"username,omitempty"`
+	Password    stringValue `json:"password,omitempty"`
+	AdminState  string      `json:"admin_state,omitempty"`
+	OperState   string      `json:"oper_state,omitempty"`
+	WritesCount uint64Value `json:"writes_count,omitempty"`
+	LastError   stringValue `json:"last_error,omitempty"`
 }
 
 type registration struct {
@@ -231,6 +257,14 @@ func (s *server) handleConfigEvent(ctx context.Context, cfg *bond.ConfigNotifica
 
 func (s *server) handleCfgPrometheusCreate(ctx context.Context, cfg *bond.ConfigNotification) {
 	newCfg := &baseConfig{
+		Scrape: &scrapeConfig{
+			AdminState: adminEnable,
+			OperState:  operDown,
+		},
+		RemoteWrite: &remoteWrite{
+			AdminState: adminDisable,
+			OperState:  operDown,
+		},
 		Registration: &registration{
 			AdminState: adminDisable,
 			OperState:  operDown,
@@ -256,17 +290,16 @@ func (s *server) handleCfgPrometheusCreate(ctx context.Context, cfg *bond.Config
 	s.config.baseConfig = newCfg
 	s.applyDebug(newCfg.Debug)
 
-	// start server if admin-state == enable
-	if newCfg.AdminState == adminEnable && s.config.baseConfig.OperState != operStarting {
-		newCfg.OperState = operStarting
-		go s.start(ctx)
-	}
+	s.syncScrape(ctx)
+	s.syncRemoteWrite(ctx)
 	// update internal telemetry status
 	s.updatePrometheusBaseTelemetry(ctx, newCfg)
 }
 
 func (s *server) handleCfgPrometheusChange(ctx context.Context, cfg *bond.ConfigNotification) {
 	newCfg := &baseConfig{
+		Scrape:       new(scrapeConfig),
+		RemoteWrite:  new(remoteWrite),
 		Registration: new(registration),
 	}
 	err := json.Unmarshal([]byte(cfg.Json), newCfg)
@@ -293,23 +326,38 @@ func (s *server) handleCfgPrometheusChange(ctx context.Context, cfg *bond.Config
 	if newCfg.Registration == nil {
 		newCfg.Registration = &registration{}
 	}
+	prevRW := remoteWrite{AdminState: adminDisable, OperState: operDown}
+	if s.config.baseConfig.RemoteWrite != nil {
+		prevRW = *s.config.baseConfig.RemoteWrite
+	}
+	if newCfg.RemoteWrite == nil {
+		newCfg.RemoteWrite = &remoteWrite{}
+	}
+	prevScrape := scrapeConfig{AdminState: adminEnable, OperState: operDown}
+	if s.config.baseConfig.Scrape != nil {
+		prevScrape = *s.config.baseConfig.Scrape
+	}
+	if newCfg.Scrape == nil {
+		newCfg.Scrape = &scrapeConfig{AdminState: adminEnable}
+	}
 	newCfg.OperState = prevOper
 	newCfg.Registration.OperState = prevRegOper
+	newCfg.RemoteWrite.OperState = prevRW.OperState
+	newCfg.RemoteWrite.WritesCount = prevRW.WritesCount
+	newCfg.RemoteWrite.LastError = prevRW.LastError
+	newCfg.Scrape.OperState = prevScrape.OperState
+	newCfg.Scrape.ScrapesCount = prevScrape.ScrapesCount
 	s.config.baseConfig = newCfg
 
 	if newCfg.AdminState == adminDisable && prevOper != operDown {
-		// shutdown the http server with a 500ms timeout
 		s.shutdown(ctx, time.Second/2)
 		return
 	}
-	if newCfg.AdminState == adminEnable && prevOper == operDown {
-		// start http server
-		log.Debug("starting server...")
-		go s.start(ctx)
-		return
-	}
+	s.syncRemoteWrite(ctx)
+	s.syncScrape(ctx)
+
 	// HTTP server already running, check if registration has to be started or stopped
-	if prevOper == operUp && newCfg.AdminState == adminEnable {
+	if s.srv != nil && newCfg.AdminState == adminEnable && scrapeOn(newCfg.Scrape) {
 		log.Debug("server is up, checking if registration needs to be started...")
 		// server is already up, check if registration needs to be started
 		if newCfg.Registration.AdminState == adminEnable && prevRegOper == operDown {
@@ -322,6 +370,31 @@ func (s *server) handleCfgPrometheusChange(ctx context.Context, cfg *bond.Config
 	}
 
 	s.updatePrometheusBaseTelemetry(ctx, s.config.baseConfig)
+}
+
+// syncScrape starts or stops the HTTP listener. Caller holds config.m.
+func (s *server) syncScrape(ctx context.Context) {
+	b := s.config.baseConfig
+	if b.Scrape == nil {
+		b.Scrape = &scrapeConfig{AdminState: adminEnable, OperState: operDown}
+	}
+	profile := b.TLSProfile.Value
+	if b.AdminState != adminEnable || !scrapeOn(b.Scrape) {
+		s.stopListenerLocked()
+		b.Scrape.OperState = operDown
+		if b.AdminState == adminEnable {
+			b.OperState = operUp
+		}
+		return
+	}
+	if s.srv != nil && b.Scrape.OperState == operUp && s.scrapeProfile == profile {
+		return
+	}
+	s.stopListenerLocked()
+	s.scrapeProfile = profile
+	b.OperState = operStarting
+	b.Scrape.OperState = operStarting
+	go s.start(ctx)
 }
 
 func (s *server) handleCfgMetricCreate(ctx context.Context, cfg *bond.ConfigNotification) {
@@ -426,7 +499,8 @@ func (s *server) handleNwInstCfg(ctx context.Context, nwInst *ndk.NetworkInstanc
 		if s.config.baseConfig.NetworkInstance.Value == name {
 			if data.GetOperIsUp() &&
 				s.config.baseConfig.AdminState == adminEnable &&
-				s.config.baseConfig.OperState == operDown {
+				scrapeOn(s.config.baseConfig.Scrape) &&
+				s.srv == nil {
 				log.Debug("starting server...")
 				go s.start(ctx)
 			}
@@ -441,7 +515,8 @@ func (s *server) handleNwInstCfg(ctx context.Context, nwInst *ndk.NetworkInstanc
 				return
 			}
 			if s.config.baseConfig.AdminState == adminEnable &&
-				s.config.baseConfig.OperState == operDown {
+				scrapeOn(s.config.baseConfig.Scrape) &&
+				s.srv == nil {
 				log.Debug("starting server...")
 				go s.start(ctx)
 			}

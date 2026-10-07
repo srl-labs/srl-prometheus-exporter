@@ -43,10 +43,11 @@ topology:
         - ./prometheus/:/etc/prometheus/
         #- ./prometheus/storage:/prometheus
       cmd: |
-        --config.file=/etc/prometheus/prometheus.yaml 
-        # --storage.tsdb.path=/prometheus 
-        --web.console.libraries=/usr/share/prometheus/console_libraries 
-        --web.console.templates=/usr/share/prometheus/consoles 
+        --config.file=/etc/prometheus/prometheus.yaml
+        --web.enable-remote-write-receiver
+        # --storage.tsdb.path=/prometheus
+        --web.console.libraries=/usr/share/prometheus/console_libraries
+        --web.console.templates=/usr/share/prometheus/consoles
         --log.level=debug
 
     consul-agent:
